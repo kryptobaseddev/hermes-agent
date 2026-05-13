@@ -1,0 +1,86 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    # Run every 12 hours (00:00 and 12:00 UTC)
+    - cron: '0 */12 * * *'
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to sync (default: main)'
+        required: false
+        default: 'main'
+        type: string
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_PAT }}
+
+      - name: Configure Git
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch upstream
+
+      - name: Merge upstream changes
+        run: |
+          BRANCH="${{ github.event.inputs.branch || 'main' }}"
+          git checkout "$BRANCH"
+          
+          # Check if upstream is ahead
+          UPSTREAM_AHEAD=$(git rev-list --count "origin/${BRANCH}..upstream/${BRANCH}")
+          
+          if [ "$UPSTREAM_AHEAD" -eq 0 ]; then
+            echo "✓ Fork is already up to date with upstream"
+            exit 0
+          fi
+          
+          echo "→ Upstream is $UPSTREAM_AHEAD commit(s) ahead, merging..."
+          
+          # Try merge (not ff-only, since fork diverges with our changes)
+          if git merge "upstream/${BRANCH}" --no-edit; then
+            echo "✓ Successfully merged upstream changes"
+          else
+            echo "✗ Merge conflict detected!"
+            echo "Manual resolution required."
+            git merge --abort
+            exit 1
+          fi
+
+      - name: Push to fork
+        run: |
+          BRANCH="${{ github.event.inputs.branch || 'main' }}"
+          git push origin "$BRANCH"
+          echo "✓ Pushed synced branch to fork"
+
+      - name: Create issue on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'upstream-sync-failed'
+            });
+            
+            if (issues.length === 0) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: 'Upstream sync failed',
+                body: `The automated upstream sync workflow failed. Please resolve merge conflicts manually.\n\nWorkflow run: ${context.payload.repository.html_url}/actions/runs/${context.runId}`,
+                labels: ['upstream-sync-failed']
+              });
+            }
