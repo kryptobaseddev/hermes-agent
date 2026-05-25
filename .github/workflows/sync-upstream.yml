@@ -12,18 +12,26 @@ on:
         default: 'main'
         type: string
 
+concurrency:
+  group: sync-upstream-${{ github.event.inputs.branch || 'main' }}
+  cancel-in-progress: false
+
 jobs:
   sync:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      issues: write
+    env:
+      BRANCH: ${{ github.event.inputs.branch || 'main' }}
+      # Use a PAT with repo+workflow scope when available. The default GITHUB_TOKEN
+      # cannot push upstream workflow-file changes into a fork.
+      SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
     steps:
       - name: Checkout fork
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ env.SYNC_TOKEN }}
 
       - name: Configure Git
         run: |
@@ -32,58 +40,51 @@ jobs:
 
       - name: Add upstream remote
         run: |
-          git remote add upstream https://github.com/NousResearch/hermes-agent.git
-          git fetch upstream
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream https://github.com/NousResearch/hermes-agent.git
+          else
+            git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          fi
+          git fetch --prune --tags upstream
+          git fetch --prune origin
 
       - name: Merge upstream changes
         run: |
-          BRANCH="${{ github.event.inputs.branch || 'main' }}"
+          set -euo pipefail
           git checkout "$BRANCH"
-          
-          # Check if upstream is ahead
-          UPSTREAM_AHEAD=$(git rev-list --count "origin/${BRANCH}..upstream/${BRANCH}")
-          
+
+          UPSTREAM_AHEAD=$(git rev-list --count "HEAD..upstream/${BRANCH}")
+
           if [ "$UPSTREAM_AHEAD" -eq 0 ]; then
-            echo "✓ Fork is already up to date with upstream"
+            echo "✓ Fork is already up to date with upstream/${BRANCH}"
             exit 0
           fi
-          
-          echo "→ Upstream is $UPSTREAM_AHEAD commit(s) ahead, merging..."
-          
-          # Try merge (not ff-only, since fork diverges with our changes)
+
+          echo "→ upstream/${BRANCH} is $UPSTREAM_AHEAD commit(s) ahead; merging into fork ${BRANCH}..."
+
           if git merge "upstream/${BRANCH}" --no-edit; then
-            echo "✓ Successfully merged upstream changes"
+            echo "✓ Successfully merged upstream/${BRANCH}"
           else
-            echo "✗ Merge conflict detected!"
-            echo "Manual resolution required."
+            echo "✗ Merge conflict detected; manual resolution required."
             git merge --abort
             exit 1
           fi
 
       - name: Push to fork
         run: |
-          BRANCH="${{ github.event.inputs.branch || 'main' }}"
-          git push origin "$BRANCH"
-          echo "✓ Pushed synced branch to fork"
+          set -euo pipefail
+          git push origin "HEAD:${BRANCH}"
+          echo "✓ Pushed synced ${BRANCH} to fork"
 
-      - name: Create issue on failure
+      - name: Failure summary
         if: failure()
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const { data: issues } = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'open',
-              labels: 'upstream-sync-failed'
-            });
-            
-            if (issues.length === 0) {
-              await github.rest.issues.create({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                title: 'Upstream sync failed',
-                body: `The automated upstream sync workflow failed. Please resolve merge conflicts manually.\n\nWorkflow run: ${context.payload.repository.html_url}/actions/runs/${context.runId}`,
-                labels: ['upstream-sync-failed']
-              });
-            }
+        run: |
+          {
+            echo '## Upstream sync failed'
+            echo
+            echo "Repository: ${GITHUB_REPOSITORY}"
+            echo "Branch: ${BRANCH}"
+            echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo
+            echo 'If the push failed with `refusing to allow a GitHub App to create or update workflow`, ensure repo secret `UPSTREAM_SYNC_TOKEN` contains a PAT with `repo` and `workflow` scopes.'
+          } >> "$GITHUB_STEP_SUMMARY"
