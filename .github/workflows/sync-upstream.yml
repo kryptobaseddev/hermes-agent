@@ -23,15 +23,14 @@ jobs:
       contents: write
     env:
       BRANCH: ${{ github.event.inputs.branch || 'main' }}
-      # Use a PAT with repo+workflow scope when available. The default GITHUB_TOKEN
-      # cannot push upstream workflow-file changes into a fork.
-      SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
     steps:
       - name: Checkout fork
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ env.SYNC_TOKEN }}
+          # Use a PAT with repo+workflow scope when available. The default
+          # GITHUB_TOKEN cannot push upstream workflow-file changes into a fork.
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
 
       - name: Configure Git
         run: |
