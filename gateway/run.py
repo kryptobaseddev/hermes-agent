@@ -2142,6 +2142,7 @@ def _resolve_runtime_agent_kwargs() -> dict:
         "api_key": runtime.get("api_key"),
         "base_url": runtime.get("base_url"),
         "provider": runtime.get("provider"),
+        "requested_provider": runtime.get("requested_provider"),
         "api_mode": runtime.get("api_mode"),
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
@@ -2164,6 +2165,7 @@ def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
         "api_key": runtime.get("api_key"),
         "base_url": runtime.get("base_url"),
         "provider": runtime.get("provider"),
+        "requested_provider": runtime.get("requested_provider"),
         "api_mode": runtime.get("api_mode"),
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
@@ -2223,6 +2225,7 @@ def _try_resolve_fallback_provider() -> dict | None:
                     "api_key": runtime.get("api_key"),
                     "base_url": runtime.get("base_url"),
                     "provider": runtime.get("provider"),
+                    "requested_provider": runtime.get("requested_provider"),
                     "api_mode": runtime.get("api_mode"),
                     "command": runtime.get("command"),
                     "args": list(runtime.get("args") or []),
@@ -4332,6 +4335,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "api_key": runtime_kwargs.get("api_key"),
             "base_url": runtime_kwargs.get("base_url"),
             "provider": runtime_kwargs.get("provider"),
+            "requested_provider": runtime_kwargs.get("requested_provider"),
             "api_mode": runtime_kwargs.get("api_mode"),
             "command": runtime_kwargs.get("command"),
             "args": list(runtime_kwargs.get("args") or []),
@@ -4344,6 +4348,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "signature": (
                 model,
                 runtime["provider"],
+                runtime["requested_provider"],
                 runtime["base_url"],
                 runtime["api_mode"],
                 runtime["command"],
@@ -10759,6 +10764,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         reply_to_is_own_message=event.reply_to_is_own_message,
                         auto_skill=event.auto_skill,
                         channel_prompt=event.channel_prompt,
+                        channel_context=event.channel_context,
                         internal=event.internal,
                         timestamp=event.timestamp,
                     )
@@ -10788,6 +10794,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             source=event.source,
                             message_id=event.message_id,
                             channel_prompt=event.channel_prompt,
+                            channel_context=event.channel_context,
                         )
                         adapter._pending_messages[_quick_key] = queued_event
                     return "Agent still starting — /steer queued for the next turn."
@@ -10810,6 +10817,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         source=event.source,
                         message_id=event.message_id,
                         channel_prompt=event.channel_prompt,
+                        channel_context=event.channel_context,
                     )
                     adapter._pending_messages[_quick_key] = queued_event
                 return "No active agent — /steer queued for the next turn."
@@ -14941,11 +14949,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event: MessageEvent,
         adapter,
     ) -> None:
-        """Extract MEDIA: tags and local file paths from a response and deliver them.
+        """Extract explicit MEDIA: tags from a response and deliver them.
 
         Called after streaming has already sent the text to the user, so the
         text itself is already delivered — this only handles file attachments
         that the normal _process_message_background path would have caught.
+
+        Unlike the non-streaming path in ``gateway/platforms/base.py`` (which
+        also auto-detects bare local paths via ``extract_local_files``), this
+        post-stream rescan is EXPLICIT-ONLY. The visible reply has already
+        been streamed verbatim, so a bare path string here was either (a)
+        already shown to the user as text, or (b) stale tool/inspected
+        content that was never part of the intended visible reply. Promoting
+        such paths into uploads after the fact sent files the model never
+        asked to deliver (#20834). Only ``MEDIA:`` directives — the explicit
+        attachment contract — trigger post-stream uploads.
         """
         from pathlib import Path
         from urllib.parse import quote as _quote
@@ -14961,16 +14979,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             media_files, cleaned = adapter.extract_media(response)
             media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
-            # Chain the cleaned text through each extractor (extract_media →
-            # extract_images → extract_local_files) so MEDIA: tags and image URLs
-            # are removed before the bare-path auto-detect runs. Previously the
-            # cleaned text from extract_media was dropped (``_``) and
-            # extract_local_files scanned text that still contained MEDIA: tags,
-            # producing false-positive bare-path matches with the MEDIA: prefix
-            # glued on. This matches the chain order in gateway/platforms/base.py.
-            _, cleaned = adapter.extract_images(cleaned)
-            local_files, _ = adapter.extract_local_files(cleaned)
-            local_files = BasePlatformAdapter.filter_local_delivery_paths(local_files)
+            # Strip image URLs from the cleaned text for parity with the
+            # non-streaming chain, but do NOT run extract_local_files here:
+            # post-stream delivery is explicit-only (#20834). Bare local paths
+            # in an already-streamed reply are text the user has seen (or
+            # stale inspected content), not an attachment request.
+            adapter.extract_images(cleaned)
 
             _thread_meta = self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
 
@@ -14991,14 +15005,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     image_paths.append(media_path)
                 else:
                     non_image_media.append((media_path, is_voice))
-
-            non_image_local: list = []
-            for file_path in local_files:
-                if (Path(file_path).suffix.lower() in _IMAGE_EXTS
-                        and not force_document_attachments):
-                    image_paths.append(file_path)
-                else:
-                    non_image_local.append(file_path)
 
             if image_paths:
                 try:
@@ -15034,24 +15040,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
-
-            for file_path in non_image_local:
-                try:
-                    ext = Path(file_path).suffix.lower()
-                    if ext in _VIDEO_EXTS:
-                        await adapter.send_video(
-                            chat_id=event.source.chat_id,
-                            video_path=file_path,
-                            metadata=_thread_meta,
-                        )
-                    else:
-                        await adapter.send_document(
-                            chat_id=event.source.chat_id,
-                            file_path=file_path,
-                            metadata=_thread_meta,
-                        )
-                except Exception as e:
-                    logger.warning("[%s] Post-stream file delivery failed: %s", adapter.name, e)
 
         except Exception as e:
             logger.warning("Post-stream media extraction failed: %s", e)
@@ -16850,6 +16838,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             cfg = user_config if isinstance(user_config, dict) else load_config()
             resolved_provider = (provider or "").strip()
             resolved_model = (model or "").strip()
+            resolved_requested_provider = ""
 
             needs_session_runtime = not resolved_provider or not resolved_model
             has_session_identity = source is not None or session_key
@@ -16863,8 +16852,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if not resolved_model and isinstance(turn_model, str):
                         resolved_model = turn_model.strip()
                     runtime_provider = runtime_kwargs.get("provider") if isinstance(runtime_kwargs, dict) else None
+                    runtime_requested_provider = (
+                        runtime_kwargs.get("requested_provider")
+                        if isinstance(runtime_kwargs, dict)
+                        else None
+                    )
                     if not resolved_provider and isinstance(runtime_provider, str):
                         resolved_provider = runtime_provider.strip()
+                    if isinstance(runtime_requested_provider, str):
+                        resolved_requested_provider = runtime_requested_provider.strip()
                 except Exception as exc:
                     logger.debug(
                         "image_routing: session runtime resolution failed, falling back to config — %s",
@@ -16876,7 +16872,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not resolved_model:
                 resolved_model = _read_main_model()
 
-            return decide_image_input_mode(resolved_provider, resolved_model, cfg)
+            return decide_image_input_mode(
+                resolved_provider,
+                resolved_model,
+                cfg,
+                requested_provider=resolved_requested_provider,
+            )
         except Exception as exc:
             logger.debug("image_routing: decision failed, falling back to text — %s", exc)
             return "text"
@@ -17899,6 +17900,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _api_key_fingerprint,
                 runtime.get("base_url", ""),
                 runtime.get("provider", ""),
+                runtime.get("requested_provider", ""),
                 runtime.get("api_mode", ""),
                 sorted(enabled_toolsets) if enabled_toolsets else [],
                 # reasoning_config excluded — it's set per-message on the
@@ -21012,6 +21014,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _status_adapter.pause_typing_for_chat(_status_chat_id)
                 except Exception:
                     pass
+
+                # Ordering barrier (#clarify-ordering): flush any buffered
+                # assistant prose (interim commentary / streamed deltas) to the
+                # platform BEFORE sending the poll.  The poll is delivered on a
+                # separate, agent-thread-blocking path; without this barrier it
+                # races ahead of prose still sitting in the stream consumer's
+                # queue, so the question renders ABOVE its own explanation.
+                # Best-effort + short timeout: never hang the agent thread if
+                # the consumer task isn't running.
+                try:
+                    _sc = stream_consumer_holder[0] if stream_consumer_holder else None
+                    _flush = getattr(_sc, "flush_pending_sync", None)
+                    if callable(_flush):
+                        _flush(timeout=3.0)
+                except Exception:
+                    logger.debug(
+                        "Stream-consumer flush before clarify prompt failed",
+                        exc_info=True,
+                    )
 
                 send_ok = False
                 fut = safe_schedule_threadsafe(
