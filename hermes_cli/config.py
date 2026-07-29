@@ -2332,13 +2332,19 @@ DEFAULT_CONFIG = {
             "model": "base",  # tiny, base, small, medium, large-v3
             "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
             "initial_prompt": "",
+            # Anti-hallucination hardening (faster-whisper decodes junk tokens
+            # from silence/noise without these):
+            "vad": True,  # Silero VAD filter — silence never reaches whisper. false = old raw behavior (music/ambient).
+            "vad_min_silence_ms": 500,  # min silence (ms) that splits speech chunks when vad is on
+            "no_speech_prob_threshold": 0.6,  # drop a segment only if no_speech_prob is ABOVE this...
+            "logprob_threshold": -1.0,  # ...AND its avg_logprob is BELOW this (both must hit)
         },
         "groq": {
             "model": "whisper-large-v3-turbo",  # whisper-large-v3, whisper-large-v3-turbo, distil-whisper-large-v3-en
             "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
         },
         "openai": {
-            "model": "whisper-1",  # whisper-1, gpt-4o-mini-transcribe, gpt-4o-transcribe
+            "model": "whisper-1",  # whisper-1, gpt-4o-mini-transcribe, gpt-4o-transcribe, gpt-transcribe
             "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
         },
         "mistral": {
@@ -3571,6 +3577,14 @@ DEFAULT_CONFIG = {
         # ``"manual"`` — only use binaries already on PATH.
         # ``"off"`` — alias for ``manual``.
         "install_strategy": "auto",
+
+        # Idle language servers are shut down automatically after this
+        # many seconds with no file activity, then respawned on demand.
+        # Prevents long-running gateway/CLI processes from accumulating
+        # stale pyright/gopls/tsserver children (hundreds of MB each,
+        # plus pipe FDs) as the agent moves across worktrees.  Set to 0
+        # to disable idle reaping and keep servers for process lifetime.
+        "idle_timeout": 600.0,
 
         # Per-server overrides.  Each key is a server_id from the
         # registry (``pyright``, ``typescript``, ``gopls``,
